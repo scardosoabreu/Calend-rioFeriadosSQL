@@ -1,0 +1,237 @@
+DECLARE @StartDate DATE = '20110101', @NumberOfYears INT = 30;
+
+-- prevent set or regional settings from interfering with 
+-- interpretation of dates / literals
+
+SET DATEFIRST 7;
+SET DATEFORMAT dmy;
+SET LANGUAGE brazilian;
+
+DECLARE @CutoffDate DATE = DATEADD(YEAR, @NumberOfYears, @StartDate);
+
+--1* criando tabela temporária #dim:
+
+DROP TABLE #dim
+CREATE TABLE #dim(
+  [date]       DATE PRIMARY KEY, 
+  [dia]        AS DATEPART(DAY,      [date]),
+  [mes]      AS DATEPART(MONTH,    [date]),
+  PrimeiroDoMes AS CONVERT(DATE, DATEADD(MONTH, DATEDIFF(MONTH, 0, [date]), 0)),
+  [NomeDoMes]  AS DATENAME(MONTH,    [date]),
+  [semana]       AS DATEPART(WEEK,     [date]),
+  [ISOweek]    AS DATEPART(ISO_WEEK, [date]),
+  [DiaDaSemana]  AS DATEPART(WEEKDAY,  [date]),
+  [quarto]    AS DATEPART(QUARTER,  [date]),
+  [ano]       AS DATEPART(YEAR,     [date]),
+  PrimeiroDoAno  AS CONVERT(DATE, DATEADD(YEAR,  DATEDIFF(YEAR,  0, [date]), 0)),
+  Style112     AS CONVERT(CHAR(8),   [date], 112),
+  Style101     AS CONVERT(CHAR(10),  [date], 101)
+);
+
+
+INSERT #dim([date]) 
+SELECT d
+
+FROM
+(
+  SELECT d = DATEADD(DAY, rn - 1, @StartDate)
+  FROM 
+  (
+    SELECT TOP (DATEDIFF(DAY, @StartDate, @CutoffDate)) 
+      rn = ROW_NUMBER() OVER (ORDER BY s1.[object_id])
+    FROM sys.all_objects AS s1
+    CROSS JOIN sys.all_objects AS s2
+    -- Suporta 5 milhões de dias
+    ORDER BY s1.[object_id]
+  ) AS x
+) AS y;
+GO
+
+--2*criando a tabela datedimension:
+
+drop table dbo.DateDimension;
+CREATE TABLE dbo.DateDimension(
+  --DateKey           INT         NOT NULL PRIMARY KEY,
+  [Date]              DATE        NOT NULL,
+  [Dia]               TINYINT     NOT NULL,
+  [DiaDaSemana]           TINYINT     NOT NULL,
+  NomeDiaSemana         VARCHAR(10) NOT NULL,
+  EhFimSemana           BIT         NOT NULL,
+  EhFeriado           BIT         NOT NULL,
+  TextoFeriado         VARCHAR(64) SPARSE,
+  DOWInMonth          TINYINT     NOT NULL,
+  [DiaDoAno]         SMALLINT    NOT NULL,
+  SemanaDoMes         TINYINT     NOT NULL,
+  SemanaDoAno          TINYINT     NOT NULL,
+  ISOWeekOfYear       TINYINT     NOT NULL,
+  [Mes]             TINYINT     NOT NULL,
+  [NomeMes]         VARCHAR(10) NOT NULL,
+  [Quarto]           TINYINT     NOT NULL,
+  [Ano]              INT         NOT NULL,
+  MMYYYY              CHAR(6)     NOT NULL,
+  MesAno           CHAR(7)     NOT NULL,
+  PrimeiroDiaDoMes     DATE        NOT NULL,
+  UltimoDiaDoMes      DATE        NOT NULL,
+  PrimeiroDiaDoQuarto DATE        NOT NULL,
+  UltimoDiaDoQuarto   DATE        NOT NULL,
+  PrimeiroDiaDoAno    DATE        NOT NULL,
+  UltimoDiaDoAno      DATE        NOT NULL,
+  PrimeiroDiaProximoMes DATE        NOT NULL,
+  PrimeiroDiaProximoAno  DATE        NOT NULL
+);
+GO
+
+-- 3* inserindo os dados da #dim na datedimension:
+
+INSERT dbo.DateDimension WITH (TABLOCKX)
+SELECT
+  --DateKey     = CONVERT(INT, Style103),
+  [Date]        = [date],
+  [Dia]         = CONVERT(TINYINT, [dia]),
+  [DiaDaSemana]     = CONVERT(TINYINT, [DiaDaSemana]),
+  [NomeDiaSemana] = CONVERT(VARCHAR(10), DATENAME(WEEKDAY, [date])),
+  [EhFimSemana]   = CONVERT(BIT, CASE WHEN [DiaDaSemana] IN (1,7) THEN 1 ELSE 0 END),
+  [EhFeriado]   = CONVERT(BIT, 0),
+  TextoFeriado   = CONVERT(VARCHAR(64), NULL),
+  [DOWInMonth]  = CONVERT(TINYINT, ROW_NUMBER() OVER 
+                  (PARTITION BY PrimeiroDoMes, [DiaDaSemana] ORDER BY [date])),
+  [DiaDoAno]   = CONVERT(SMALLINT, DATEPART(DAYOFYEAR, [date])),
+  SemanaDoMes   = CONVERT(TINYINT, DENSE_RANK() OVER 
+                  (PARTITION BY [ano], [mes] ORDER BY [semana])),
+  SemanaDoAno    = CONVERT(TINYINT, [semana]),
+  ISOWeekOfYear = CONVERT(TINYINT, ISOWeek),
+  [Mes]       = CONVERT(TINYINT, [mes]),
+  [NomeMes]   = CONVERT(VARCHAR(10), [NomeDoMes]),
+  [Quarto]     = CONVERT(TINYINT, [quarto]),
+  [Ano]        = [ano],
+  MMYYYY        = CONVERT(CHAR(6), LEFT(Style101, 2)    + LEFT(Style112, 4)),
+  MesAno     = CONVERT(CHAR(7), LEFT([NomeDoMes], 3) + LEFT(Style112, 4)),
+  PrimeiroDiaDoMes     = PrimeiroDoMes,
+  UltimoDiaDoMes      = MAX([date]) OVER (PARTITION BY [ano], [mes]),
+  PrimeiroDiaDoQuarto   = MIN([date]) OVER (PARTITION BY [ano], [quarto]),
+  UltimoDiaDoQuarto    = MAX([date]) OVER (PARTITION BY [ano], [quarto]),
+  PrimeiroDiaDoAno      = PrimeiroDoAno,
+  UltimoDiaDoAno       = MAX([date]) OVER (PARTITION BY [ano]),
+  PrimeiroDiaProximoMes = DATEADD(MONTH, 1, PrimeiroDoMes),
+  PrimeiroDiaProximoAno  = DATEADD(YEAR,  1,PrimeiroDoAno)
+FROM #dim
+OPTION (MAXDOP 1);
+
+--4* tratando feriados nacionais fixos:
+
+
+;WITH x AS 
+(
+  SELECT /* DateKey, */ [Date], EhFeriado, TextoFeriado, PrimeiroDiaDoAno,
+    DOWInMonth, [NomeMes], [NomeDiaSemana], [Dia],
+    LastDOWInMonth = ROW_NUMBER() OVER 
+    (
+      PARTITION BY PrimeiroDiaDoMes, [DiaDaSemana] 
+      ORDER BY [Date] DESC
+    )
+  FROM dbo.DateDimension
+)
+UPDATE x SET EhFeriado = 1, TextoFeriado = CASE
+  WHEN ([Dia] = 1 AND [NomeMes] = 'Janeiro') 
+	THEN 'Dia de Ano Novo'  --(ano novo)
+
+  WHEN ([Dia] = 21 AND [NomeMes] = 'Abril')
+		THEN 'Tiradentes'          -- (Tiradentes)
+
+	WHEN ([NomeMes] = 'Maio' AND [Dia] = 1)
+		THEN 'Trabalhadores'          -- (Trabalhador)
+
+
+	WHEN ([NomeMes] = 'Setembro' AND [Dia] = 7)
+		THEN 'Independencia'          -- (Independencia)
+
+	WHEN ([NomeMes] = 'Outubro' AND [Dia] = 12)
+		THEN 'Nsra. Aparecida'          -- (Nossa Senhora Aparecida)
+
+	WHEN ([NomeMes] = 'Novembro' AND [Dia] = 2)
+		THEN 'Finados'          -- (Finados)
+
+	WHEN ([NomeMes] = 'Novembro' AND [Dia] = 15)
+		THEN 'Proc Republica'          -- (Proclamação da republica)
+
+	WHEN ([NomeMes] = 'Novembro' AND [Dia] = 20)
+		THEN 'Consciencia Negra'          -- (Consciencia Negra)
+
+	WHEN ([NomeMes] = 'Abril' AND [Dia] = 23)
+		THEN 'São Jorge'          -- (São Jorge)
+
+	WHEN ([NomeMes] = 'Dezembro' AND [Dia] = 25)
+		THEN 'Natal'          -- (Natal)
+		
+
+	END
+WHERE 
+  ([Date] = PrimeiroDiaDoAno)
+  OR ([DOWInMonth] = 3     AND [NomeMes] = 'Abril'   AND [Dia] = 21) --Tiradentes -DOWInMonth ultimo dia da semana do mes
+  OR ([DOWInMonth] = 1     AND [NomeMes] = 'Maio'    AND [Dia] = 1) --dia do trabalhador
+  OR ([DOWInMonth] = 1     AND [NomeMes] = 'Setembro'  AND [Dia] = 7) --independencia
+  OR ([DOWInMonth] = 2     AND [NomeMes] = 'Outubro'  AND [Dia] = 12) -- (Nossa Senhora Aparecida)
+  OR ([DOWInMonth] = 1     AND [NomeMes] = 'Novembro' AND [Dia] = 2) -- (Finados)
+  OR ([DOWInMonth] = 3     AND [NomeMes] = 'Novembro'   AND [Dia] = 15) -- (Proclamação da republica)
+  OR ([DOWInMonth] = 3     AND [NomeMes] = 'Novembro'   AND [Dia] = 20) -- (Consciencia Negra)
+  OR ([DOWInMonth] = 4     AND [NomeMes] = 'Abril'   AND [Dia] = 23) -- (São Jorge)
+  OR ([NomeMes] = 'Dezembro' AND [Dia] = 25); --(natal)
+
+	 
+  
+
+  --4*feriados móveis e a páscoa:---
+
+GO
+CREATE FUNCTION dbo.GetEasterHolidays
+(
+@ano INT
+) 
+RETURNS TABLE
+WITH SCHEMABINDING
+AS 
+RETURN 
+(
+  WITH x AS 
+  (
+    SELECT [Date] = CONVERT(DATE, RTRIM(@ano) + '0' + RTRIM([Mes]) 
+        + RIGHT('0' + RTRIM([Dia]),2))
+      FROM (SELECT [Mes], [Dia] = DaysToSunday + 28 - (31 * ([Mes] / 4))
+      FROM (SELECT [Mes] = 3 + (DaysToSunday + 40) / 44, DaysToSunday
+      FROM (SELECT DaysToSunday = paschal - ((@ano + @ano / 4 + paschal - 13) % 7)
+      FROM (SELECT paschal = epact - (epact / 28)
+      FROM (SELECT epact = (24 + 19 * (@ano % 19)) % 30) 
+        AS epact) AS paschal) AS dts) AS m) AS d
+  )
+  SELECT [Date], HolidayName = 'Domingo de Aleluia' FROM x
+    UNION ALL SELECT DATEADD(DAY,-2,[Date]), 'Sexta-feira Santa'   FROM x
+    UNION ALL SELECT DATEADD(DAY, 1,[Date]), 'Segunda de Páscoa' FROM x
+	
+	
+);
+
+GO
+
+;WITH x AS 
+(
+  SELECT d.[Date], d.EhFeriado, d.TextoFeriado, h.HolidayName
+    FROM dbo.DateDimension AS d
+    CROSS APPLY dbo.GetEasterHolidays(d.[Ano]) AS h
+    WHERE d.[Date] = h.[Date]
+)
+UPDATE x SET EhFeriado = 1, TextoFeriado = HolidayName;
+
+---TENTANDO CARNAVAL:
+UPDATE d SET EhFeriado = 1, TextoFeriado = 'Carnaval'
+FROM dbo.DateDimension AS d
+INNER JOIN
+(
+  SELECT /* DateKey, */ [Date], [Ano], [DiaDoAno]
+  FROM dbo.DateDimension 
+  WHERE TextoFeriado = 'Easter Monday'
+) AS src 
+ON d.[Ano] = src.[Ano] 
+AND d.[DiaDoAno] = src.[DiaDoAno] - 47;
+
+
+
